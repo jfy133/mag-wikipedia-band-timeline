@@ -1,0 +1,186 @@
+---
+title: "Wikpedia Rockband Timeline Figure for nf-core/mag"
+author: "James A. Fellows Yates"
+format: html
+editor: visual
+---
+
+This notebook describes how you can generate a [Wikipedia band-member timeline plot](https://en.wikipedia.org/wiki/List_of_Iron_Maiden_band_members#Timeline) from a Git repo.
+
+## Get raw data
+
+To get raw data, you can use the following command on a Git repo (make sure to update the location of repo)
+
+We do a shallow clone to make the cloning process faster, generate the contribution information from the `log` command, and then delete the shallow clone after.
+
+```{bash}
+git clone --depth 1 git@github.com:nf-core/mag.git
+git -C ~/git/nf-core/mag --no-pager log --pretty=format:"%h%x09%an%x09%ad%x09%s" --date=iso | cut -f 2-3 > "nf-core-mag_contribs.tsv"
+rm -rf mag/
+```
+
+## Clean raw data
+
+Load relevant libraries
+
+```{r}
+library(readr)
+library(janitor)
+library(tidyr)
+library(stringr)
+library(dplyr)
+library(lubridate)
+library(tibble)
+library(ggplot2)
+library(paletteer)
+
+sessionInfo()
+
+```
+
+## Data cleaning and summarising
+
+We can then load the data and do some basic cleaning.
+
+```{r}
+data_raw <- read_tsv(paste0("nf-core-mag_contribs.tsv"), col_names = c("committer", "date_of_commit")) |> clean_names()
+
+data_committers <- data_raw |>
+  select(committer) |>
+  unique() |>
+  arrange(committer) |>
+  write_tsv(paste0("nf-core-mag_contribs_list.tsv"))
+```
+
+Now we have to do some manual clean up of the git log output, as in some cases we may only have GitHub handle(s!) rather than a name, and also we want to annotate with organisation each member was/is a member of.
+
+I have separately made a user-name-org database file manually that we can load and bind onto our git log data
+
+```{r}
+data_contributor_db <- read_tsv("nf-core-mag-contribs_db.tsv")
+
+data_full <- left_join(data_raw, data_contributor_db)
+```
+
+We can then use this information plus other information to filter and summarise the table with the commit history, namely: remove bots, and remove users with less than a given number of commits.
+
+In this case we will only include contributors with more than 10 commits.
+
+```{r}
+data_filtered_n_commits <- data_full |> 
+  group_by(name) |> 
+  summarise(n_commits = n()) |> 
+  arrange(desc(n_commits))  |> 
+  filter(name != "bot", n_commits >= 10)
+```
+
+We can then filter the table for the people with more than 10 commits, and then calculate and then calculate their weekly commits.
+
+```{r}
+data_weekly_commits <- data_full |>
+  mutate(week = cut.Date(as.Date(date_of_commit), breaks = "1 week")) |> 
+  select(name, organisation, organisation_colour, week) |> 
+  filter(name %in% data_filtered_n_commits$name)
+```
+
+We can also extract the timestamp for the plot
+
+```{r}
+data_timestamp <- data_full |> select(date_of_commit) |> arrange(date_of_commit) |> last() |> pull() |> as_date()
+```
+
+Now we can reduce our full history, and then extract their first and last commit date. We will then reorder and fix the order of names for plotting purposes.
+
+```{r}
+data_final_start_stop <- data_weekly_commits |>
+  select(name, week, organisation) |>
+  filter(name %in% data_filtered_n_commits$name) |>
+  group_by(name) |>
+  summarise(
+    first_commit = as_date(last(week)),
+    latest_commit = as_date(first(week)),
+    organisation = unique(organisation)
+  ) |>
+  arrange(first_commit, latest_commit) |>
+  mutate(name = factor(name, levels = name),
+         organisation = factor(organisation, levels = unique(organisation)),
+         first_commit = first_commit - 30,
+         latest_commit = latest_commit + 30
+         )
+
+```
+
+## Plotting
+
+Here is a basic plot using a palette with a sufficient number of colours
+
+```{r}
+plot_wikipedia_style <- ggplot(data_final_start_stop, aes(x = first_commit, y = name, colour = organisation)) +
+ geom_segment(aes(xend = latest_commit, yend = name, linewidth = 10)) +
+ geom_point(data = data_weekly_commits, aes(x = as_date(week), y = name), colour = 'white', size = 0.3) +
+ scale_x_date(date_breaks = "1 year", date_minor_breaks = "4 months", date_labels = "%Y", labels = label_at(1)) +
+ scale_y_discrete(limits = rev(levels(data_final_start_stop$name))) +
+ theme_classic(base_family = 'Inter') +
+ scale_colour_paletteer_d("LaCroixColoR::paired", ) +
+ theme(legend.position = "bottom", text = element_text(family = "Inter")) +
+ guides(linewidth = "none") +
+ xlab("Date") +
+ ylab("Contributor (with 10 or more commits)") +
+ labs(colour = 'Organisation')
+
+plot_wikipedia_style
+```
+
+To make a nicer looking image we can take the primary colours of each organisation and use this to fill the bars.
+
+This information I included in the source file for `data_contributor_db`, and colour picked from each organisations website.
+
+```{r}
+palettes_orgs <- data_contributor_db |> 
+  select(organisation, organisation_colour) |> 
+  distinct() |> 
+  filter(!is.na(organisation)) |> 
+  deframe()
+```
+
+Finally we can try to plot the timeline
+
+```{r}
+plot_wikipedia_style_orgcolours <- plot_wikipedia_style + scale_colour_manual(values = palettes_orgs)
+
+plot_wikipedia_style_orgcolours
+
+```
+
+We can also customise this slightly to indicate handovers of primary development teams
+
+```{r, fig.width=8, height=2}
+theme_alternating_grid <- function() {
+  theme_classic() +
+    theme(
+      panel.grid.major.y = element_line(color = "grey90", size = 3.7),
+      panel.grid.minor.y = element_line(color = "white"),
+      text = element_text(family = "Inter", size = 8)
+    )
+}
+
+plot_wikipedia_style_orgcoloursannotations <- plot_wikipedia_style_orgcolours +
+  theme_alternating_grid() +
+  geom_vline(xintercept = as.numeric(date('2019-12-21'))) + ## Hadrien - Sabrina/Daniel handover, based on first release made on GH
+  geom_vline(xintercept = as.numeric(date('2022-06-14'))) +  ## Sabrina/Daniel - James handover, based on first release made on GH 
+  geom_segment(data = data_final_start_stop |> filter(name == 'Hadrien Gourlé'), xend = as.numeric(date('2019-12-21')),  aes(yend = name, linewidth = 5), colour = '#FFFFFF') +
+  geom_segment(data = data_final_start_stop |> filter(name == 'Sabrina Krakau'), xend = as.numeric(date('2022-06-14')), aes(yend = name, linewidth = 5), colour = '#FFFFFF') +
+  geom_segment(data = data_final_start_stop |> filter(name == 'Daniel Straub'),  x = as.numeric(date('2019-12-21')), xend = as.numeric(date('2022-06-14')), aes(yend = name, linewidth = 5), colour = '#FFFFFF') +
+  geom_segment(data = data_final_start_stop |> filter(name == 'James A. Fellows Yates'), x=as.numeric(date('2022-06-14')), aes(xend = latest_commit, linewidth = 5), colour = '#FFFFFF') +
+labs(caption = paste0('As of ', as.character(data_timestamp)))
+
+
+plot_wikipedia_style_orgcoloursannotations
+
+```
+
+```{r}
+ggsave(plot_wikipedia_style_orgcoloursannotations, filename = 'nf-core-mag-contributors-timeline-plot.png', device = 'png', height=107, width = 178, units = 'mm', dpi=300)
+ggsave(plot_wikipedia_style_orgcoloursannotations, filename = 'nf-core-mag-contributors-timeline-plot.svg', device = 'svg', height=107, width = 178, units = 'mm', dpi=300)
+
+```
